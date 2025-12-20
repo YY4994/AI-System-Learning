@@ -1,0 +1,5 @@
+Metadata-Version: 2.1
+Name: my_swish
+Version: 0.1.0
+Summary: CUDA extension for Swish activation function
+Author: Huang Yuyao

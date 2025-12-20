@@ -1,21 +1,18 @@
-#ifndef SWISH_H
-#define SWISH_H
+// 第一行必须是这个！
+#define TORCH_EXTENSION_NAME my_swish
+#pragma once
+#include <torch/extension.h>
+#include "swish_cuda_kernel.cuh"
 
-#include <cmath>
-#include <cstdint>
-#include <vector>
-
-namespace swish
+class MySwishFunction : public torch::autograd::Function<MySwishFunction>
 {
-    class SwishFunction
-    {
-    public:
-        // 静态方法，便于调用
-        static void forward_cpu(const float *x, float *y, float *saved_s, int64_t n);
-        static void backward_cpu(const float *grad_output, const float *x, const float *saved_s, float *grad_input, int64_t n);
+public:
+    // 注意：返回类型和方法签名需要精确
+    static torch::Tensor forward(
+        torch::autograd::AutogradContext *ctx,
+        const torch::Tensor &input); // 添加const引用
 
-        // (可选) 也可以作为实例类，保存中间状态
-    };
-}
-
-#endif // SWISH_H
+    static torch::autograd::tensor_list backward( // 返回tensor_list，不是Tensor
+        torch::autograd::AutogradContext *ctx,
+        const torch::autograd::tensor_list &grad_outputs); // 添加const引用, tensor_list类型
+};

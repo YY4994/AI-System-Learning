@@ -1,0 +1,7 @@
+setup.py
+my_swish.egg-info/PKG-INFO
+my_swish.egg-info/SOURCES.txt
+my_swish.egg-info/dependency_links.txt
+my_swish.egg-info/top_level.txt
+src/swish_cuda.cpp
+src/swish_cuda_kernel.cu
