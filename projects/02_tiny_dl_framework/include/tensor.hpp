@@ -12,6 +12,7 @@
 #include <iterator>
 #include <initializer_list>
 #include <iostream>
+#include "function.hpp
 
 namespace tiny_dl
 {
@@ -121,166 +122,75 @@ namespace tiny_dl
         Storage &operator=(Storage &) = delete;
     };
 
-    template <typename Derived>
-    class TensorBase
+    template <typename Scalar, typename Device = CPU>
+    class TensorImpl
     {
-    protected:
+    private:
+        using AllocatorType = typename Device::template DefaultAllocator<Scalar>;
+        // === 第一部分：数据与视图（不可变核心）===
+        std::shared_ptr<Storage<Scalar, AllocatorType>> storage_;
         std::vector<size_t> shape_;
         std::vector<size_t> strides_;
         size_t offset_ = 0;
 
+        // === 第二部分：自动求导状态（可变）===
+        bool requires_grad_ = false;
+        std::weak_ptr<Function> grad_fn_;                  // 生成该Tensor的Function，用于反向传播
+        std::shared_ptr<TensorImpl<Scalar, Device>> grad_; // 该Tensor的梯度
+
+        // === 第三部分：版本与元数据 ===
+        size_t version_ = 0;
+        size_t unique_id_ = 0; // 全局唯一ID，用于标识不同Tensor实例
     public:
-        TensorBase() = default;
-        ~TensorBase() = default;
-
-        // 静态多态：静态转换到派生类
-        Derived &derived() { return static_cast<Derived &>(*this); }
-        const Derived &derived() const { return static_cast<const Derived &>(*this); }
-        // 通用函数
-        const std::vector<size_t> &shape() const { return shape_; }
-        const size_t size() const
-        {
-            if (shape_.empty())
-                return 0;
-            return std::accumulate(shape_.begin(), shape_.end(), 1, std::multiplies<size_t>());
-        }
-        // 计算索引
-        template <typename... Indices>
-        size_t compute_index(Indices... indices) const
-        {
-            // 1. 检查维度数量匹配（编译期）
-            if (sizeof...(indices) != shape_.size())
-            {
-                throw std::runtime_error("Number of indices does not match number of dimensions");
-            }
-
-            // 2. 展开参数包计算偏移
-            size_t index = offset_;
-            size_t dim = 0;
-            ((index += strides_[dim++] * indices), ...); // 折叠表达式
-
-            return index;
-        }
-        // 计算步长
-        std::vector<size_t> compute_strides(const std::vector<size_t> &shape)
-        {
-            if (shape.empty())
-                return {};
-            std::vector<size_t> strides(shape.size());
-            strides.back() = 1;
-            for (int i = shape.size() - 2; i >= 0; --i)
-            {
-                strides[i] = strides[i + 1] * shape[i + 1];
-            }
-            return strides;
-        }
-    };
-
-    template <typename Scalar, typename Device = CPU>
-    class Tensor : public TensorBase<Tensor<Scalar, Device>>
-    {
-    private:
-        using Base = TensorBase<Tensor<Scalar, Device>>;
-        using Base::offset_;
-        using Base::shape_;
-        using Base::strides_;
-        using AllocatorType = typename Device::template DefaultAllocator<Scalar>;
-
-        std::shared_ptr<Storage<Scalar, AllocatorType>> storage_;
-        // 视图构造函数
-        Tensor(const Tensor &other,
-               const std::vector<size_t> &new_shape,
-               const std::vector<size_t> &new_strides,
-               const size_t new_offset)
-            : storage_(other.storage_)
-        {
-            shape_ = new_shape;
-            strides_ = new_strides;
-            offset_ = new_offset;
-        }
-
-    public:
-        using value_type = Scalar;
-        using device_type = Device;
-        using allocator_type = typename Device::template DefaultAllocator<Scalar>;
-        static_assert(std::is_arithmetic_v<Scalar>, "Scalar must be arithmetic type");
         // 构造函数
-        Tensor()
+        TensorImpl() : storage_(nullptr), shape_({0}), strides_({0}), offset_(0), version_(0), grad_fn_(), grad_(nullptr)
         {
-            shape_ = {0}; // 1维，长度为0
-            strides_ = {1};
-            offset_ = 0;
-            storage_ = std::make_shared<Storage<Scalar, AllocatorType>>(0); // 分配0容量
+            static size_t global_id = 0x10000;
+            unique_id_ = global_id++;
         }
-        explicit Tensor(const std::vector<size_t> &shape)
+        // 构造函数：从形状构造
+        TensorImpl(const std::vector<size_t> &shape, bool requires_grad = false)
         {
-            size_t total_size = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
-            storage_ = std::make_shared<Storage<Scalar, AllocatorType>>(total_size); // 接受参数为size_t，返回shared_ptr<Storage<Scalar,AllocatorType>>
-            std::fill(storage_->data(), storage_->data() + total_size, 0);
-            // std::cout << "从形状构造Tensor，total_size: " << total_size << std::endl;
+            storage_ = std::make_shared<Storage<Scalar, AllocatorType>>(shape);
             shape_ = shape;
-            strides_ = this->compute_strides(shape); // 计算strides
+            strides_ = compute_strides(shape);
             offset_ = 0;
+            requires_grad_ = requires_grad;
         }
-        // 1. 从标量构造（广播）
-        Tensor(Scalar value, const std::vector<size_t> &shape) noexcept
+        // 构造函数：从数据构造
+        TensorImpl(const std::shared_ptr<Storage<Scalar, AllocatorType>> &storage,
+                   const std::vector<size_t> &shape,
+                   const std::vector<size_t> &strides,
+                   size_t offset)
+            : storage_(storage), shape_(shape), strides_(strides), offset_(offset), version_(0), grad_fn_(), grad_(nullptr)
         {
-            size_t total_size = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
-            storage_ = std::make_shared<Storage<Scalar, allocator_type>>(total_size);
-            std::fill(storage_->data(), storage_->data() + total_size, value);
+            static size_t global_id = 0xf000;
+            unique_id_ = global_id++;
+        }
+        // 构造函数：从标量构造（广播）
+        TensorImpl(Scalar scalar, const std::vector<size_t> &shape, bool requires_grad = false)
+        {
+            storage_ = std::make_shared<Storage<Scalar, AllocatorType>>(shape);
+            std::fill(storage_->data(), storage_->data() + storage_->capacity(), scalar);
             shape_ = shape;
-            strides_ = this->compute_strides(shape); // 计算strides
+            strides_ = compute_strides(shape);
             offset_ = 0;
-        };
-        // 2. 通过一维向量构造
-        Tensor(std::initializer_list<Scalar> data)
-        {
-            // std::cout << "通过一维向量构造，data size: " << data.size() << std::endl;
-            // std::vector<size_t> data(data_elements.begin(), data_elements.end());
-            if (data.size() == 0)
-            {
-                throw std::runtime_error("data is empty");
-            }
-            storage_ = std::make_shared<Storage<Scalar, allocator_type>>(data.size());
-            std::copy(data.begin(), data.end(), storage_->data());
-            shape_ = {data.size()};
-            strides_ = this->compute_strides(shape_);
-            offset_ = 0;
+            requires_grad_ = requires_grad;
+            static size_t global_id = 0x5000;
+            unique_id_ = global_id++;
         }
-        // 3. 通过二维向量构造
-        Tensor(std::initializer_list<std::initializer_list<Scalar>> data)
+        // 构造函数：创建视图
+        TensorImpl(const TensorImpl &other,
+                   const std::vector<size_t> &new_shape,
+                   const std::vector<size_t> &new_strides,
+                   size_t new_offset)
+            : storage_(other.storage_), shape_(new_shape), strides_(new_strides), offset_(new_offset), version_(0), grad_fn_(), grad_(nullptr)
         {
-            if (data.size() <= 0 || data.begin()->size() <= 0)
-            {
-                throw std::invalid_argument("data size is zero");
-            }
-            shape_ = {data.size(), data.begin()->size()};
-            storage_ = std::make_shared<Storage<Scalar, allocator_type>>(data.size() * data.begin()->size());
-            size_t i = 0;
-            for (auto &row : data)
-            {
-                if (row.size() != shape_[1]) // 添加行长度检查
-                    throw std::invalid_argument("inconsistent row sizes");
-                std::copy(row.begin(), row.end(), storage_->data() + i);
-                i += row.size();
-            }
-            strides_ = this->compute_strides(shape_);
-            offset_ = 0;
-        }
-        // 4. 拷贝构造函数（深拷贝）
-        Tensor(Tensor &&other) noexcept
-            : storage_(std::make_shared<Storage<Scalar, AllocatorType>>(other.storage_->capacity()))
-        {
-            shape_ = other.shape_;
-            strides_ = other.strides_;
-            offset_ = other.offset_;
-            if (other.storage_ && other.storage_->data())
-            {
-                std::copy(other.data(), other.data() + other.size(), this->data());
-            }
+            static size_t global_id = 0xa000;
+            unique_id_ = global_id++;
         }
         // 析构函数
-        ~Tensor() = default;
+        ~TensorImpl() = default;
 
         // 获取数据指针
         Scalar *data()
@@ -300,22 +210,176 @@ namespace tiny_dl
             return storage_->data() + offset_;
         }
 
-        // 创建新形状视图
-        Tensor reshape(const std::vector<size_t> &new_shape)
+        // 通用函数
+        const size_t size() const
         {
-            size_t new_size = std::accumulate(new_shape.begin(), new_shape.end(), 1, std::multiplies<size_t>());
+            if (shape_.empty())
+                return 0;
+            return std::accumulate(shape_.begin(), shape_.end(), 1, std::multiplies<size_t>());
+        }
+        const std::vector<size_t> &shape() const { return shape_; }
+
+        // 自动求导相关
+        void set_requires_grad(bool requires_grad)
+        {
+            requires_grad_ = requires_grad;
+        }
+        bool requires_grad() const { return requires_grad_; }
+        void set_grad_fn(const std::shared_ptr<Function> &grad_fn)
+        {
+            grad_fn_ = grad_fn;
+        }
+        void set_grad(const std::shared_ptr<TensorImpl<Scalar, Device>> &grad)
+        {
+            grad_ = grad;
+        }
+        std::shared_ptr<TensorImpl<Scalar, Device>> grad() const { return grad_; }
+        std::shared_ptr<Function> grad_fn() const { return grad_fn_; }
+
+        void make_modified()
+        {
+            version_++;
+        }
+        // 检查输入是否有效（用于Function的backward）
+        bool is_valid_input(size_t saved_version) const
+        {
+            return version_ == saved_version; // 版本号匹配说明未被修改
+        }
+        // 计算步长
+        std::vector<size_t> compute_strides(const std::vector<size_t> &shape)
+        {
+            if (shape.empty())
+                return {};
+            std::vector<size_t> strides(shape.size());
+            strides.back() = 1;
+            for (int i = shape.size() - 2; i >= 0; --i)
+            {
+                strides[i] = strides[i + 1] * shape[i + 1];
+            }
+            return strides;
+        }
+        // 计算索引
+        template <typename... Indices>
+        size_t compute_index(Indices... indices) const
+        {
+            // 1. 检查维度数量匹配（编译期）
+            if (sizeof...(indices) != shape_.size())
+            {
+                throw std::runtime_error("Number of indices does not match number of dimensions");
+            }
+
+            // 2. 展开参数包计算偏移
+            size_t index = offset_;
+            size_t dim = 0;
+            ((index += strides_[dim++] * indices), ...); // 折叠表达式
+
+            return index;
+        }
+        // 创建视图（工厂方法）
+        std::shared_ptr<TensorImpl<Scalar, Device>> view(const std::vector<size_t> &shape) const
+        {
+            size_t new_size = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
             if (new_size != this->size())
             {
-                std::cout << "New shape size " << new_size << " does not match tensor size " << std::endl;
                 throw std::runtime_error("New shape size does not match tensor size");
             }
-            return Tensor(*this, new_shape, this->compute_strides(new_shape), offset_);
+            auto new_strides = compute_strides(shape);
+            return std::make_shared<TensorImpl<Scalar, Device>>(*this, shape, new_strides, offset_);
+        }
+    };
+
+    template <typename Scalar, typename Device = CPU>
+    class Tensor
+    {
+    private:
+        std::shared_ptr<TensorImpl<Scalar, Device>> impl_;
+        // 静态辅助函数
+
+    public:
+        static_assert(std::is_arithmetic_v<Scalar>, "Scalar must be arithmetic type");
+        using ImplType = TensorImpl<Scalar, Device>;
+        using AllocatorType = typename Device::template DefaultAllocator<Scalar>;
+        // === 构造函数 ===
+        Tensor()
+        {
+            impl_ = std::make_shared<ImplType>();
+        }
+        explicit Tensor(const std::vector<size_t> &shape, bool requires_grad = false)
+        {
+            impl_ = std::make_shared<ImplType>(shape, requires_grad);
+        }
+        // 从标量构造（广播）
+        Tensor(Scalar value, const std::vector<size_t> &shape, bool requires_grad = false) noexcept
+        {
+            impl_ = std::make_shared<ImplType>(value, shape, requires_grad);
+        };
+        ~Tensor() = default;
+
+        // === 数据访问，委托给impl_对象 ===
+        Scalar *data()
+        {
+            return impl_->data();
+        }
+        const Scalar *data() const
+        {
+            return impl_->data();
+        }
+        template <typename... Indices>
+        Scalar &operator()(Indices... indices)
+        {
+            if (!impl_ || !impl_->data())
+            {
+                throw std::runtime_error("Tensor has no implementation or data");
+            }
+            size_t index = impl_->compute_index(indices...);
+            if (index >= impl_->size())
+            {
+                throw std::out_of_range("Index out of bounds");
+            }
+            return impl_->data()[index];
+        }
+        // === 自动求导接口 ===
+        void set_requires_grad(bool requires_grad)
+        {
+            impl_->set_requires_grad(requires_grad);
+        }
+        bool requires_grad() const
+        {
+            return impl_->requires_grad();
+        }
+        Tensor grad() const
+        {
+            if (!impl_->requires_grad())
+            {
+                throw std::runtime_error("This tensor does not require grad");
+            }
+            auto grad_impl = impl_->grad();
+            if (!grad_impl)
+            {
+                return Tensor(); // 返回空Tensor，表示梯度尚未计算
+            }
+            return Tensor(grad_impl); // 用grad_impl构造Tensor句柄
+        }
+        // 创建新形状视图
+        Tensor view(const std::vector<size_t> &new_shape)
+        {
+            return Tensor(impl_->view(new_shape));
+        }
+        Tensor reshape(const std::vector<size_t> &new_shape)
+        {
+            // 验证新形状是否合法
+            size_t new_size = std::accumulate(new_shape.begin(), new_shape.end(), 1, std::multiplies<size_t>());
+            if (new_size != impl_->size())
+            {
+                throw std::runtime_error("New shape size does not match tensor size");
+            }
+            return view(new_shape);
         }
         // 深拷贝
         Tensor clone() const
         {
-            Tensor new_tensor(shape_);
-            std::copy(data(), data() + this->size(), new_tensor.data());
+            Tensor new_tensor(impl_->shape());
+            std::copy(data(), data() + impl_->size(), new_tensor.data());
             return new_tensor;
         }
 
@@ -324,45 +388,59 @@ namespace tiny_dl
         {
             if (this != &other)
             {
-                shape_ = std::move(other.shape_);
-                strides_ = std::move(other.strides_);
-                offset_ = other.offset_;
-                storage_ = std::move(other.storage_);
-                other.offset_ = 0;
-                other.shape_.clear();
-                other.strides_.clear();
+                impl_ = std::move(other.impl_);
+                other.impl_ = nullptr;
             }
             return *this;
         }
-        // 加法运算符
+        // === 运算符重载 ===
         template <typename otherScalar, typename otherDevice>
         Tensor operator+(const Tensor<otherScalar, otherDevice> &other) const
         {
-            static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
+            // static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
             static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
-            if (shape_ != other.shape_ || shape_.empty())
+            if (this->impl_->shape() != other.impl_->shape())
             {
-                throw std::runtime_error("Incompatible shapes for + operation");
+                throw std::runtime_error("Shape mismatch for + operation");
             }
-            Tensor result(shape_);
-            for (size_t i = 0; i < this->size(); i++)
+            Tensor result(this->impl_->shape());
+            for (size_t i = 0; i < this->impl_->size(); i++)
             {
                 result(i) = data()[i] + other.data()[i];
             }
             return result;
         }
-
-        template <typename... Indices>
-        Scalar &operator()(Indices... indices)
+        template <typename otherScalar, typename otherDevice>
+        Tensor operator-(const Tensor<otherScalar, otherDevice> &other) const
         {
-            if (!storage_ || !storage_->data())
-                throw std::runtime_error("Tensor data is null");
-            size_t index = this->compute_index(indices...);
-            if (index >= this->size())
+            // static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
+            static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
+            if (this->impl_->shape() != other.impl_->shape())
             {
-                throw std::out_of_range("Index out of bounds");
+                throw std::runtime_error("Shape mismatch for + operation");
             }
-            return storage_->data()[index];
+            Tensor result(this->impl_->shape());
+            for (size_t i = 0; i < this->impl_->size(); i++)
+            {
+                result(i) = data()[i] - other.data()[i];
+            }
+            return result;
+        }
+        template <typename otherScalar, typename otherDevice>
+        Tensor operator*(const Tensor<otherScalar, otherDevice> &other) const
+        {
+            // static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
+            static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
+            if (this->impl_->shape() != other.impl_->shape())
+            {
+                throw std::runtime_error("Shape mismatch for + operation");
+            }
+            Tensor result(this->impl_->shape());
+            for (size_t i = 0; i < this->impl_->size(); i++)
+            {
+                result(i) = data()[i] * other.data()[i];
+            }
+            return result;
         }
     };
 } // namespace tiny_dl
