@@ -30,6 +30,17 @@ namespace tiny_dl
     };
 #endif
 
+    // 前向声明
+    class Function;
+
+    // 访问令牌 - 只有Function能创建
+    class ImplAccessToken
+    {
+    private:
+        ImplAccessToken() = default; // 私有构造函数
+        friend class Function;       // 只有Function能构造
+    };
+
     template <typename Scalar, typename Allocator = CPU::template DefaultAllocator<Scalar>>
     class Storage // 独占所有权
     {
@@ -218,7 +229,7 @@ namespace tiny_dl
             return std::accumulate(shape_.begin(), shape_.end(), 1, std::multiplies<size_t>());
         }
         const std::vector<size_t> &shape() const { return shape_; }
-
+        const size_t version() const { return version_; }
         // 自动求导相关
         void set_requires_grad(bool requires_grad)
         {
@@ -293,7 +304,58 @@ namespace tiny_dl
     {
     private:
         std::shared_ptr<TensorImpl<Scalar, Device>> impl_;
-        // 静态辅助函数
+
+        // 广播两个形状，返回广播后的形状
+        vector<size_t> broadcast_shape(const vector<size_t> &shape1, const vector<size_t> &shape2) const
+        {
+            size_t shape1_size = shape1.size();
+            size_t shape2_size = shape2.size();
+            size_t max_size = std::max(shape1_size, shape2_size);
+            // 结果形状
+            vector<size_t> result_shape(max_size);
+            // 遍历两个形状，将较小的形状用1填充
+            for (size_t i = 0; i < max_size; ++i)
+            {
+                size_t dim1 = (i < shape1_size) ? shape1[shape1_size - 1 - i] : 1;
+                size_t dim2 = (i < shape2_size) ? shape2[shape2_size - 1 - i] : 1;
+                if (dim1 != dim2 && dim1 != 1 && dim2 != 1)
+                {
+                    throw std::runtime_error("Shapes cannot be broadcast together");
+                }
+                result_shape[i] = std::max(dim1, dim2);
+            }
+        }
+        // 源索引到目标索引的映射
+        size_t map_index(const std::vector<size_t> &idx,
+                         const std::vector<size_t> &source_shape,
+                         const std::vector<size_t> &target_shape) const
+        {
+            size_t source_dims = source_shape.size();
+            size_t target_dims = target_shape.size();
+            size_t source_index = 0;
+            size_t stride = 1;
+            for (size_t dim_offset = 0; dim_offset < source_dims; ++dim_offset)
+            {
+                size_t target_dim_idx = target_dims - 1 - dim_offset;
+                size_t input_dim_size = source_shape[source_dim_idx];
+                size_t target_dim_size = target_shape[target_dim_idx];
+                if (input_dim_size == target_dim_size)
+                {
+                    source_index += target_shape[target_dim_idx] * stride;
+                }
+                else if (input_dim_size == 1)
+                {
+                    // 广播维度，索引始终为0
+                    source_index += 0;
+                }
+                else
+                {
+                    throw std::runtime_error("Incompatible shapes for broadcasting");
+                }
+                stride *= target_dim_size;
+            }
+            return source_index;
+        }
 
     public:
         static_assert(std::is_arithmetic_v<Scalar>, "Scalar must be arithmetic type");
@@ -311,19 +373,18 @@ namespace tiny_dl
         // 从标量构造（广播）
         Tensor(Scalar value, const std::vector<size_t> &shape, bool requires_grad = false) noexcept
         {
+
             impl_ = std::make_shared<ImplType>(value, shape, requires_grad);
         };
+        // 从已有Impl构造（内部使用）
+        Tensor(ImplAccessToken, const std::shared_ptr<ImplType> &impl) : impl_(impl) {}
         ~Tensor() = default;
 
         // === 数据访问，委托给impl_对象 ===
-        Scalar *data()
-        {
-            return impl_->data();
-        }
-        const Scalar *data() const
-        {
-            return impl_->data();
-        }
+        // 数据访问（公开，但只读指针）
+        const Scalar *data() const { return impl_->data(); }
+        // 可写数据访问需要令牌
+        Scalar *data(ImplAccessToken) { return impl_->data(); }
         template <typename... Indices>
         Scalar &operator()(Indices... indices)
         {
@@ -337,6 +398,31 @@ namespace tiny_dl
                 throw std::out_of_range("Index out of bounds");
             }
             return impl_->data()[index];
+        }
+        // === 受限的内部接口（需要令牌）===
+        // 获取TensorImpl指针
+        std::shared_ptr<TensorImpl<Scalar, Device>> impl(ImplAccessToken) const
+        {
+            return impl_;
+        }
+
+        // 创建弱引用用于SavedTensor
+        std::weak_ptr<void> weak_impl(ImplAccessToken) const
+        {
+            return std::static_pointer_cast<void>(impl_);
+        }
+
+        // 标记修改（增加版本号）
+        void mark_modified(ImplAccessToken)
+        {
+            impl_->make_modified();
+        }
+
+        // 获取当前版本号
+        size_t version(ImplAccessToken) const
+        {
+            // 需要在TensorImpl中添加版本号获取方法
+            return impl_->version();
         }
         // === 自动求导接口 ===
         void set_requires_grad(bool requires_grad)
@@ -397,48 +483,144 @@ namespace tiny_dl
         template <typename otherScalar, typename otherDevice>
         Tensor operator+(const Tensor<otherScalar, otherDevice> &other) const
         {
-            // static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
             static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
-            if (this->impl_->shape() != other.impl_->shape())
+            if (this->impl_->shape() == other.impl_->shape())
             {
-                throw std::runtime_error("Shape mismatch for + operation");
+                Tensor<Scalar, Device> result(this->impl_->shape());
+                for (size_t i = 0; i < this->impl_->size(); ++i)
+                {
+                    result.impl_->data()[i] = this->impl_->data()[i] + other.impl_->data()[i];
+                }
+                return result;
             }
-            Tensor result(this->impl_->shape());
-            for (size_t i = 0; i < this->impl_->size(); i++)
+            else if (this->impl_->shape().size() == 1)
             {
-                result(i) = data()[i] + other.data()[i];
+                for (size_t i = 0; i < other.impl_->size(); ++i)
+                {
+                    Tensor<Scalar, Device> result(other.impl_->shape());
+                    result.impl_->data()[i] = this->impl_->data()[0] + other.impl_->data()[i];
+                }
+                return result;
             }
-            return result;
-        }
-        template <typename otherScalar, typename otherDevice>
-        Tensor operator-(const Tensor<otherScalar, otherDevice> &other) const
-        {
-            // static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
-            static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
-            if (this->impl_->shape() != other.impl_->shape())
+            else if (other.impl_->shape().size() == 1)
             {
-                throw std::runtime_error("Shape mismatch for + operation");
+                for (size_t i = 0; i < this->impl_->size(); ++i)
+                {
+                    Tensor<Scalar, Device> result(this->impl_->shape());
+                    result.impl_->data()[i] = this->impl_->data()[i] + other.impl_->data()[0];
+                }
+                return result;
             }
-            Tensor result(this->impl_->shape());
-            for (size_t i = 0; i < this->impl_->size(); i++)
+            else
             {
-                result(i) = data()[i] - other.data()[i];
+                // 获取广播后形状
+                auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
+                Tensor<Scalar, Device> result(result_shape);
+                auto total_dim = result_shape.size();
+                auto total_size = std::accumulate(result_shape.begin(), result_shape.end(), 1, std::multiplies<size_t>());
+
+                std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
+                // 遍历每一个元素，将一维索引映射为多维索引
+                for (size_t i = 0; i < total_size; ++i)
+                {
+                    size_t temp = i;
+                    for (size_t j = total_dim - 1; j >= 0; --j)
+                    {
+                        idx[j] = temp % result_shape[j];
+                        temp /= result_shape[j];
+                    }
+                    // 计算当前索引对应的元素在源张量中索引
+                    size_t this_index = map_index(idx, this->impl_->shape(), result_shape);
+                    size_t other_index = map_index(idx, other.impl_->shape(), result_shape);
+
+                    result.impl_->data()[i] = this->impl_->data()[this_index] + other.impl_->data()[other_index];
+                }
+                return result;
             }
-            return result;
         }
         template <typename otherScalar, typename otherDevice>
         Tensor operator*(const Tensor<otherScalar, otherDevice> &other) const
         {
-            // static_assert(std::is_same_v<Scalar, otherScalar>, "Incompatible types for + operation");
             static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
-            if (this->impl_->shape() != other.impl_->shape())
+            if (this->impl_->shape() == other.impl_->shape())
             {
-                throw std::runtime_error("Shape mismatch for + operation");
+                Tensor<Scalar, Device> result(this->impl_->shape());
+                for (size_t i = 0; i < this->impl_->size(); ++i)
+                {
+                    result.impl_->data()[i] = this->impl_->data()[i] * other.impl_->data()[i];
+                }
+                return result;
             }
-            Tensor result(this->impl_->shape());
-            for (size_t i = 0; i < this->impl_->size(); i++)
+            else if (this->impl_->shape().size() == 1)
             {
-                result(i) = data()[i] * other.data()[i];
+                for (size_t i = 0; i < other.impl_->size(); ++i)
+                {
+                    Tensor<Scalar, Device> result(other.impl_->shape());
+                    result.impl_->data()[i] = this->impl_->data()[0] * other.impl_->data()[i];
+                }
+                return result;
+            }
+            else if (other.impl_->shape().size() == 1)
+            {
+                for (size_t i = 0; i < this->impl_->size(); ++i)
+                {
+                    Tensor<Scalar, Device> result(this->impl_->shape());
+                    result.impl_->data()[i] = this->impl_->data()[i] * other.impl_->data()[0];
+                }
+                return result;
+            }
+            else
+            {
+                // 获取广播后形状
+                auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
+                Tensor<Scalar, Device> result(result_shape);
+                auto total_dim = result_shape.size();
+                auto total_size = std::accumulate(result_shape.begin(), result_shape.end(), 1, std::multiplies<size_t>());
+
+                std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
+                // 遍历每一个元素，将一维索引映射为多维索引
+                for (size_t i = 0; i < total_size; ++i)
+                {
+                    size_t temp = i;
+                    for (size_t j = total_dim - 1; j >= 0; --j)
+                    {
+                        idx[j] = temp % result_shape[j];
+                        temp /= result_shape[j];
+                    }
+                    // 计算当前索引对应的元素在源张量中索引
+                    size_t this_index = map_index(idx, this->impl_->shape(), result_shape);
+                    size_t other_index = map_index(idx, other.impl_->shape(), result_shape);
+
+                    result.impl_->data()[i] = this->impl_->data()[this_index] * other.impl_->data()[other_index];
+                }
+                return result;
+            }
+        }
+        Tensor matmul(const Tensor &other) const
+        {
+            if (impl_->shape().size() != 2 || other.impl_->shape().size() != 2)
+            {
+                throw std::runtime_error("Both tensors must be 2D for matmul");
+            }
+            size_t m = impl_->shape()[0];
+            size_t n = impl_->shape()[1];
+            size_t p = other.impl_->shape()[1];
+            if (n != other.impl_->shape()[0])
+            {
+                throw std::runtime_error("Inner dimensions must match for matmul");
+            }
+            Tensor result({m, p});
+            for (size_t i = 0; i < m; ++i)
+            {
+                for (size_t j = 0; j < p; ++j)
+                {
+                    Scalar sum = 0;
+                    for (size_t k = 0; k < n; ++k)
+                    {
+                        sum += (*this)(i, k) * other(k, j);
+                    }
+                    result(i, j) = sum;
+                }
             }
             return result;
         }
