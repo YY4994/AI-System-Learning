@@ -32,6 +32,7 @@ namespace tiny_dl
 
     // 前向声明
     class Function;
+    class Tensor;
 
     // 访问令牌 - 只有Function能创建
     class ImplAccessToken
@@ -39,6 +40,7 @@ namespace tiny_dl
     private:
         ImplAccessToken() = default; // 私有构造函数
         friend class Function;       // 只有Function能构造
+        friend class Tensor;         // 只有Tensor能构造
     };
 
     template <typename Scalar, typename Allocator = CPU::template DefaultAllocator<Scalar>>
@@ -146,7 +148,7 @@ namespace tiny_dl
 
         // === 第二部分：自动求导状态（可变）===
         bool requires_grad_ = false;
-        std::weak_ptr<Function> grad_fn_;                  // 生成该Tensor的Function，用于反向传播
+        std::weak_ptr<Function<Scalar, Device>> grad_fn_;  // 生成该Tensor的Function，用于反向传播
         std::shared_ptr<TensorImpl<Scalar, Device>> grad_; // 该Tensor的梯度
 
         // === 第三部分：版本与元数据 ===
@@ -305,6 +307,7 @@ namespace tiny_dl
     private:
         std::shared_ptr<TensorImpl<Scalar, Device>> impl_;
 
+        // 工具函数，用于创建广播计算所需的形状和索引映射
         // 广播两个形状，返回广播后的形状
         vector<size_t> broadcast_shape(const vector<size_t> &shape1, const vector<size_t> &shape2) const
         {
@@ -355,6 +358,40 @@ namespace tiny_dl
                 stride *= target_dim_size;
             }
             return source_index;
+        }
+
+        // 工具函数，用于收集所有Function
+        template <typename Scalar, typename Device = CPU>
+        using FunctionType = Function<Scalar, Device>;
+        void dfs_collect_functions(const ImplAccessToken &token,
+                                   const std::shared_ptr<FunctionType> &func,
+                                   std::unordered_set<std::shared_ptr<FunctionType>> &visited,
+                                   std::vector<std::shared_ptr<FunctionType>> &functions) const
+        {
+            if (!func || visited.count(func.get()) > 0)
+            {
+                return;
+            }
+
+            visited.insert(func);
+            inputs = func->get_saved_inputs(token);
+            for (const auto &input : inputs)
+            {
+                if (auto input_grad_fn = input->grad_fn())
+                {
+                    dfs_collect_functions(token, input_grad_fn, visited, functions);
+                }
+            }
+            functions.push_back(func);
+        }
+        std::vector<std::shared_ptr<FunctionType>> collect_functions(const ImplAccessToken &token,
+                                                                     const std::shared_ptr<FunctionType> &func) const
+        {
+            std::unordered_set<std::shared_ptr<FunctionType>> visited;
+            std::vector<std::shared_ptr<FunctionType>> functions;
+            // 先将后续节点加入，再反转顺序，保证反向传播顺序
+            dfs_collect_functions(token, func, visited, functions);
+            return std::reverse(functions.begin(), functions.end());
         }
 
     public:
@@ -469,6 +506,72 @@ namespace tiny_dl
             return new_tensor;
         }
 
+        // 反向传播
+        Tensor backward(Tensor grad_output)
+        {
+            // 检查是否需要梯度计算
+            if (!requires_grad())
+            {
+                throw std::runtime_error("This tensor does not require grad");
+            }
+            if (!impl_->grad_fn())
+            {
+                throw std::runtime_error("No grad_fn associated with this tensor");
+            }
+
+            // 确保grad_output的形状与当前张量匹配
+            if (!grad_output.impl_)
+            {
+                // 如果没有提供梯度输出，创建一个与当前张量形状相同的全1张量
+                this->grad = Tensor(Scalar(1.0), impl_->shape());
+            }
+            else
+            {
+                this->grad = grad_output;
+            }
+
+            // 收集所有相关的Function
+            ImplAccessToken token;
+            auto functions = collect_functions(token, impl_->grad_fn());
+            std::vector<Tensor<Scalar, Device>> grad_outputs;
+            // 顺序遍历Function列表，依次调用backward
+            for (auto &func : functions)
+            {
+                // 1. 收集该Function所有输出的梯度
+                for (auto &output : func->get_output_impls())
+                {
+                    if (output->grad())
+                    {
+                        grad_outputs.push_back(output->grad());
+                    }
+                    else
+                    {
+                        Tensor<Scalar, Device> zero_grad(Scalar(0), output->shape());
+                        grad_outputs.push_back(zero_grad);
+                    }
+                }
+                // 2. 执行反向传播
+                auto grad_inputs = func->backward(grad_outputs);
+                // 3. 将梯度累加到输入Tensor
+                auto saved_inputs = func->get_saved_inputs(token);
+                size_t total_inputs = saved_inputs.size();
+                for (size_t i = 0; i < total_inputs; i++)
+                {
+                    current_grad = grad_inputs[i];
+                    if (saved_inputs[i]->grad())
+                    {
+                        auto existing_grad = saved_inputs[i]->grad();
+                        // 累加梯度
+                        saved_inputs[i]->set_grad(existing_grad + current_grad);
+                    }
+                    else
+                    {
+                        saved_inputs[i]->set_grad(current_grad);
+                    }
+                }
+            }
+        }
+
         // 移动赋值运算符
         Tensor &operator=(Tensor &&other) noexcept
         {
@@ -484,145 +587,135 @@ namespace tiny_dl
         Tensor operator+(const Tensor<otherScalar, otherDevice> &other) const
         {
             static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
-            if (this->impl_->shape() == other.impl_->shape())
+            if (this->requires_grad() || other.requires_grad())
             {
-                Tensor<Scalar, Device> result(this->impl_->shape());
-                for (size_t i = 0; i < this->impl_->size(); ++i)
-                {
-                    result.impl_->data()[i] = this->impl_->data()[i] + other.impl_->data()[i];
-                }
-                return result;
-            }
-            else if (this->impl_->shape().size() == 1)
-            {
-                for (size_t i = 0; i < other.impl_->size(); ++i)
-                {
-                    Tensor<Scalar, Device> result(other.impl_->shape());
-                    result.impl_->data()[i] = this->impl_->data()[0] + other.impl_->data()[i];
-                }
-                return result;
-            }
-            else if (other.impl_->shape().size() == 1)
-            {
-                for (size_t i = 0; i < this->impl_->size(); ++i)
-                {
-                    Tensor<Scalar, Device> result(this->impl_->shape());
-                    result.impl_->data()[i] = this->impl_->data()[i] + other.impl_->data()[0];
-                }
-                return result;
+                auto func = std::make_shared<AddFunction<Scalar, Device>>();
+                Tensor result = func->forward({*this, other})[0];
+                return result[0];
             }
             else
             {
-                // 获取广播后形状
-                auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
-                Tensor<Scalar, Device> result(result_shape);
-                auto total_dim = result_shape.size();
-                auto total_size = std::accumulate(result_shape.begin(), result_shape.end(), 1, std::multiplies<size_t>());
-
-                std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
-                // 遍历每一个元素，将一维索引映射为多维索引
-                for (size_t i = 0; i < total_size; ++i)
+                if (this->impl_->shape() == other.impl_->shape())
                 {
-                    size_t temp = i;
-                    for (size_t j = total_dim - 1; j >= 0; --j)
+                    Tensor<Scalar, Device> result(this->impl_->shape());
+                    for (size_t i = 0; i < this->impl_->size(); ++i)
                     {
-                        idx[j] = temp % result_shape[j];
-                        temp /= result_shape[j];
+                        result.impl_->data()[i] = this->impl_->data()[i] + other.impl_->data()[i];
                     }
-                    // 计算当前索引对应的元素在源张量中索引
-                    size_t this_index = map_index(idx, this->impl_->shape(), result_shape);
-                    size_t other_index = map_index(idx, other.impl_->shape(), result_shape);
-
-                    result.impl_->data()[i] = this->impl_->data()[this_index] + other.impl_->data()[other_index];
+                    return result;
                 }
-                return result;
+                else if (this->impl_->shape().size() == 1)
+                {
+                    for (size_t i = 0; i < other.impl_->size(); ++i)
+                    {
+                        Tensor<Scalar, Device> result(other.impl_->shape());
+                        result.impl_->data()[i] = this->impl_->data()[0] + other.impl_->data()[i];
+                    }
+                    return result;
+                }
+                else if (other.impl_->shape().size() == 1)
+                {
+                    for (size_t i = 0; i < this->impl_->size(); ++i)
+                    {
+                        Tensor<Scalar, Device> result(this->impl_->shape());
+                        result.impl_->data()[i] = this->impl_->data()[i] + other.impl_->data()[0];
+                    }
+                    return result;
+                }
+                else
+                {
+                    // 获取广播后形状
+                    auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
+                    Tensor<Scalar, Device> result(result_shape);
+                    auto total_dim = result_shape.size();
+                    auto total_size = std::accumulate(result_shape.begin(), result_shape.end(), 1, std::multiplies<size_t>());
+
+                    std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
+                    // 遍历每一个元素，将一维索引映射为多维索引
+                    for (size_t i = 0; i < total_size; ++i)
+                    {
+                        size_t temp = i;
+                        for (size_t j = total_dim - 1; j >= 0; --j)
+                        {
+                            idx[j] = temp % result_shape[j];
+                            temp /= result_shape[j];
+                        }
+                        // 计算当前索引对应的元素在源张量中索引
+                        size_t this_index = map_index(idx, this->impl_->shape(), result_shape);
+                        size_t other_index = map_index(idx, other.impl_->shape(), result_shape);
+
+                        result.impl_->data()[i] = this->impl_->data()[this_index] + other.impl_->data()[other_index];
+                    }
+                    return result;
+                }
             }
         }
         template <typename otherScalar, typename otherDevice>
         Tensor operator*(const Tensor<otherScalar, otherDevice> &other) const
         {
             static_assert(std::is_same_v<Device, otherDevice>, "Incompatible devices for + operation");
-            if (this->impl_->shape() == other.impl_->shape())
+            if (this->requires_grad() || other.requires_grad())
             {
-                Tensor<Scalar, Device> result(this->impl_->shape());
-                for (size_t i = 0; i < this->impl_->size(); ++i)
-                {
-                    result.impl_->data()[i] = this->impl_->data()[i] * other.impl_->data()[i];
-                }
-                return result;
-            }
-            else if (this->impl_->shape().size() == 1)
-            {
-                for (size_t i = 0; i < other.impl_->size(); ++i)
-                {
-                    Tensor<Scalar, Device> result(other.impl_->shape());
-                    result.impl_->data()[i] = this->impl_->data()[0] * other.impl_->data()[i];
-                }
-                return result;
-            }
-            else if (other.impl_->shape().size() == 1)
-            {
-                for (size_t i = 0; i < this->impl_->size(); ++i)
-                {
-                    Tensor<Scalar, Device> result(this->impl_->shape());
-                    result.impl_->data()[i] = this->impl_->data()[i] * other.impl_->data()[0];
-                }
-                return result;
+                auto func = std::make_shared<MulFunction<Scalar, Device>>();
+                Tensor result = func->forward({*this, other})[0];
+                return result[0];
             }
             else
             {
-                // 获取广播后形状
-                auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
-                Tensor<Scalar, Device> result(result_shape);
-                auto total_dim = result_shape.size();
-                auto total_size = std::accumulate(result_shape.begin(), result_shape.end(), 1, std::multiplies<size_t>());
-
-                std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
-                // 遍历每一个元素，将一维索引映射为多维索引
-                for (size_t i = 0; i < total_size; ++i)
+                if (this->impl_->shape() == other.impl_->shape())
                 {
-                    size_t temp = i;
-                    for (size_t j = total_dim - 1; j >= 0; --j)
+                    Tensor<Scalar, Device> result(this->impl_->shape());
+                    for (size_t i = 0; i < this->impl_->size(); ++i)
                     {
-                        idx[j] = temp % result_shape[j];
-                        temp /= result_shape[j];
+                        result.impl_->data()[i] = this->impl_->data()[i] * other.impl_->data()[i];
                     }
-                    // 计算当前索引对应的元素在源张量中索引
-                    size_t this_index = map_index(idx, this->impl_->shape(), result_shape);
-                    size_t other_index = map_index(idx, other.impl_->shape(), result_shape);
-
-                    result.impl_->data()[i] = this->impl_->data()[this_index] * other.impl_->data()[other_index];
+                    return result;
                 }
-                return result;
-            }
-        }
-        Tensor matmul(const Tensor &other) const
-        {
-            if (impl_->shape().size() != 2 || other.impl_->shape().size() != 2)
-            {
-                throw std::runtime_error("Both tensors must be 2D for matmul");
-            }
-            size_t m = impl_->shape()[0];
-            size_t n = impl_->shape()[1];
-            size_t p = other.impl_->shape()[1];
-            if (n != other.impl_->shape()[0])
-            {
-                throw std::runtime_error("Inner dimensions must match for matmul");
-            }
-            Tensor result({m, p});
-            for (size_t i = 0; i < m; ++i)
-            {
-                for (size_t j = 0; j < p; ++j)
+                else if (this->impl_->shape().size() == 1)
                 {
-                    Scalar sum = 0;
-                    for (size_t k = 0; k < n; ++k)
+                    for (size_t i = 0; i < other.impl_->size(); ++i)
                     {
-                        sum += (*this)(i, k) * other(k, j);
+                        Tensor<Scalar, Device> result(other.impl_->shape());
+                        result.impl_->data()[i] = this->impl_->data()[0] * other.impl_->data()[i];
                     }
-                    result(i, j) = sum;
+                    return result;
+                }
+                else if (other.impl_->shape().size() == 1)
+                {
+                    for (size_t i = 0; i < this->impl_->size(); ++i)
+                    {
+                        Tensor<Scalar, Device> result(this->impl_->shape());
+                        result.impl_->data()[i] = this->impl_->data()[i] * other.impl_->data()[0];
+                    }
+                    return result;
+                }
+                else
+                {
+                    // 获取广播后形状
+                    auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
+                    Tensor<Scalar, Device> result(result_shape);
+                    auto total_dim = result_shape.size();
+                    auto total_size = std::accumulate(result_shape.begin(), result_shape.end(), 1, std::multiplies<size_t>());
+
+                    std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
+                    // 遍历每一个元素，将一维索引映射为多维索引
+                    for (size_t i = 0; i < total_size; ++i)
+                    {
+                        size_t temp = i;
+                        for (size_t j = total_dim - 1; j >= 0; --j)
+                        {
+                            idx[j] = temp % result_shape[j];
+                            temp /= result_shape[j];
+                        }
+                        // 计算当前索引对应的元素在源张量中索引
+                        size_t this_index = map_index(idx, this->impl_->shape(), result_shape);
+                        size_t other_index = map_index(idx, other.impl_->shape(), result_shape);
+
+                        result.impl_->data()[i] = this->impl_->data()[this_index] * other.impl_->data()[other_index];
+                    }
+                    return result;
                 }
             }
-            return result;
         }
     };
 } // namespace tiny_dl
