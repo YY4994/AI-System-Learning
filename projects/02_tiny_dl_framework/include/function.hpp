@@ -1,11 +1,37 @@
 #pragma once
 
-#include "tensor.hpp"
+#include <cmath>
+#include <vector>
+#include <string>
+#include <memory>
+#include <stdexcept>
+#include <algorithm>
+#include <numeric>
+#include <type_traits>
+#include <utility>
+#include <iterator>
+#include <initializer_list>
+#include <iostream>
+#include <functional>
+#include <unordered_set>
 
 namespace tiny_dl
 {
     template <typename Scalar, typename Device>
+    class Tensor;
+    template <typename Scalar, typename Device>
+    class TensorImpl;
+    class ImplAccessToken
+    {
+    private:
+        ImplAccessToken() = default; // 私有构造函数
+        template <typename Scalar, typename Device>
+        friend class Function; // 只有Function能构造
+        template <typename Scalar, typename Device>
+        friend class Tensor; // 只有Tensor能构造
+    };
     // 安全地保存输入Tensor的“快照”，用于反向传播。
+    template <typename Scalar, typename Device>
     class SavedTensor
     {
         using TensorType = Tensor<Scalar, Device>;
@@ -22,7 +48,7 @@ namespace tiny_dl
     public:
         SavedTensor(ImplAccessToken token, const TensorType &tensor)
         {
-            weak_impl_ = tensor.weak_impl(token);
+            weak_impl_ = tensor.weak_impl_typed(token);
             saved_shape_ = tensor.impl(token)->shape();
             saved_strides_ = tensor.impl(token)->strides();
             saved_offset_ = tensor.impl(token)->offset();
@@ -33,62 +59,75 @@ namespace tiny_dl
         // 恢复Tensor：检查版本，如果有效则返回强引用
         TensorType recover(ImplAccessToken token)
         {
-            auto impl = weak_impl_.lock();
+            // auto weak_typed = std::static_pointer_cast<ImplType>(weak_impl_);
+            auto void_impl = weak_impl_.lock();
+            if (!void_impl)
+                return TensorType();
+            auto impl = std::static_pointer_cast<ImplType>(void_impl);
             if (!impl || impl->version() != saved_version_)
-                return TensorType(); // 返回空Tensor，表示无效
-            return TensorType(impl);
+                return TensorType();
+            return TensorType(token, impl);
         }
 
         bool is_valid(ImplAccessToken token)
         {
-            auto impl = weak_impl_.lock();
-            return impl && impl->version() == saved_version_;
+            auto void_impl = weak_impl_.lock();
+            if (!void_impl)
+            {
+                return false;
+            }
+            // 需要转换为ImplType类型
+            auto impl = std::static_pointer_cast<ImplType>(void_impl);
+            return impl->version() == saved_version_;
         }
     };
 
     // 基类，所有函数的基类
     template <typename Scalar, typename Device>
-    class Function
+    class Function : public std::enable_shared_from_this<Function<Scalar, Device>>
     {
+    protected:
         using TensorType = Tensor<Scalar, Device>;
         using ImplType = TensorImpl<Scalar, Device>;
 
-    protected:
-        std::vector<SavedTensor<Scalar, Device>> saved_inputs_; // 保存的中间结果
-        std::vector<std::weak_ptr<ImplType>> output_impls_;
+        using std::enable_shared_from_this<Function<Scalar, Device>>::shared_from_this;
+        using std::enable_shared_from_this<Function<Scalar, Device>>::weak_from_this;
 
-        size_t sequence_number_;      // 在计算图中的顺序（用于调试） = 0; // 需要的输入数量
-        bool isdifferentable_ = true; // 是否可微分
+        std::vector<SavedTensor<Scalar, Device>> saved_inputs_; // 保存的中间结果
+        std::vector<std::weak_ptr<ImplType>> output_impls_;     // 保存的输出
+        size_t sequence_number_;                                // 在计算图中的顺序（用于调试） = 0; // 需要的输入数量
+        bool is_differentiable_ = true;                         // 是否可微分
 
         ImplAccessToken get_token() { return ImplAccessToken(); }
 
         // 保存中间结果（用于反向传播，foreward中调用）
-        void save_inputs(ImplAccessToken token, const TensorType &inputs)
+        void save_inputs(ImplAccessToken token, const std::vector<TensorType> &inputs)
         {
             saved_inputs_.clear();
             for (auto &input : inputs)
             {
-                saved_inputs.push_back(SavedTensor(token, input));
+                saved_inputs_.push_back(SavedTensor(token, input));
             }
         }
         // 标记输出（建立grad_fn关联）
-        void mark_outputs(ImplAccessToken token, std::shared_ptr<TensorType> outputs)
+        void mark_outputs(ImplAccessToken token, const std::vector<TensorType> &outputs)
         {
             output_impls_.clear();
             for (auto &output : outputs)
             {
-                output.impl(token)->set_grad_fn(shared_from_this()); // Tensor c “知道”了自己是由哪个Function计算产生的
-                output_impls_.push_back(output.weak_impl(token));    // 让Function对象（父）也能知道它生成了哪些Tensor（子）
+                // output.impl(token)->set_grad_fn(std::make_shared<Function>(output)); // 错误，不应该由Tensor来创建Function
+                output.impl(token)->set_grad_fn(this->shared_from_this()); // Tensor c “知道”了自己是由哪个Function计算产生的
+                output_impls_.push_back(output.weak_impl_typed(token));    // 让Function对象（父）也能知道它生成了哪些Tensor（子）
             }
         }
         // 广播两个形状，返回广播后的形状
-        vector<size_t> broadcast_shape(const vector<size_t> &shape1, const vector<size_t> &shape2) const
+        std::vector<size_t> broadcast_shape(const std::vector<size_t> &shape1, const std::vector<size_t> &shape2) const
         {
             size_t shape1_size = shape1.size();
             size_t shape2_size = shape2.size();
             size_t max_size = std::max(shape1_size, shape2_size);
             // 结果形状
-            vector<size_t> result_shape(max_size);
+            std::vector<size_t> result_shape(max_size);
             // 遍历两个形状，将较小的形状用1填充
             for (size_t i = 0; i < max_size; ++i)
             {
@@ -100,6 +139,7 @@ namespace tiny_dl
                 }
                 result_shape[i] = std::max(dim1, dim2);
             }
+            return result_shape;
         }
         // 源索引到目标索引的映射
         size_t map_index(const std::vector<size_t> &idx,
@@ -110,27 +150,37 @@ namespace tiny_dl
             size_t target_dims = target_shape.size();
             size_t source_index = 0;
             size_t stride = 1;
-            for (size_t dim_offset = 0; dim_offset < source_dims; ++dim_offset)
+
+            for (size_t dim_offset = 0; dim_offset < target_dims; ++dim_offset)
             {
-                size_t source_dim_idx = source_dims - 1 - dim_offset;
                 size_t target_dim_idx = target_dims - 1 - dim_offset;
-                size_t input_dim_size = source_shape[source_dim_idx];
+                size_t source_dim_idx = source_dims - 1 - dim_offset;
+
+                // 如果source维度不足，对应维度大小为1
+                size_t source_dim_size = (dim_offset < source_dims) ? source_shape[source_dim_idx] : 1;
                 size_t target_dim_size = target_shape[target_dim_idx];
-                if (input_dim_size == target_dim_size)
-                {
-                    source_index += target_shape[target_dim_idx] * stride;
-                }
-                else if (input_dim_size == 1)
+
+                size_t idx_in_target = idx[target_dim_idx];
+                size_t idx_in_source = 0;
+
+                if (source_dim_size == 1)
                 {
                     // 广播维度，索引始终为0
-                    source_index += 0;
+                    idx_in_source = 0;
+                }
+                else if (source_dim_size == target_dim_size)
+                {
+                    idx_in_source = idx_in_target;
                 }
                 else
                 {
                     throw std::runtime_error("Incompatible shapes for broadcasting");
                 }
-                stride *= target_dim_size;
+
+                source_index += idx_in_source * stride;
+                stride *= source_dim_size;
             }
+
             return source_index;
         }
 
@@ -142,6 +192,7 @@ namespace tiny_dl
         }
         virtual ~Function() = default;
         // === 核心接口 ===
+        size_t sequence_number() const { return sequence_number_; }
 
         // 前向传播：接收Tensor句柄，返回Tensor句柄
         virtual std::vector<TensorType> forward(std::vector<TensorType> inputs) = 0;
@@ -156,11 +207,11 @@ namespace tiny_dl
             for (auto &saved_input : saved_inputs_)
             {
                 auto input = saved_input.recover(token);
-                if (!input)
+                if (input.shape().empty() || input.data() == nullptr)
                 {
                     throw std::runtime_error("Saved input is no longer valid");
                 }
-                inputs.push_back(*input);
+                inputs.push_back(input);
             }
             return inputs;
         }
@@ -179,13 +230,15 @@ namespace tiny_dl
         }
     };
 
-    template <typename Scalar, typename Device = CPU>
+    template <typename Scalar, typename Device>
     class AddFunction : public Function<Scalar, Device>
     {
+        using typename Function<Scalar, Device>::TensorType;
+
     public:
-        using TensorType = typename Function<Scalar, Device>::TensorType;
         std::vector<TensorType> forward(std::vector<TensorType> inputs) override
         {
+            printf("AddFunction::forward\n");
             if (inputs.size() != 2)
             {
                 throw std::runtime_error("AddFunction requires exactly 2 inputs");
@@ -197,12 +250,12 @@ namespace tiny_dl
             this->save_inputs(token, {input1, input2}); // 保存输入
             auto input_shape1 = input1.shape();
             auto input_shape2 = input2.shape();
-            auto output_shape = broadcast_shape(input_shape1, input_shape2);
-            TensorType output(output_shape); // 创建输出Tensor
+            auto output_shape = this->broadcast_shape(input_shape1, input_shape2); // 广播形状
+            TensorType output(output_shape);                                       // 创建输出Tensor
 
             if (input_shape1 == input_shape2)
             {
-                for (size_t i = 0; i < input_shape1; ++i)
+                for (size_t i = 0; i < input_shape1.size(); ++i)
                 {
                     output.impl(token)->data()[i] = input1.data()[i] + input2.data()[i];
                 }
@@ -238,8 +291,8 @@ namespace tiny_dl
                         temp /= output_shape[j];
                     }
                     // 计算当前索引对应的元素在源张量中索引
-                    size_t idx1 = map_index(idx, input_shape1, output_shape);
-                    size_t idx2 = map_index(idx, input_shape2, output_shape);
+                    size_t idx1 = this->map_index(idx, input_shape1, output_shape);
+                    size_t idx2 = this->map_index(idx, input_shape2, output_shape);
 
                     output.impl(token)->data()[i] = input1.data()[idx1] + input2.data()[idx2];
                 }
@@ -282,8 +335,8 @@ namespace tiny_dl
             {
                 // 处理广播情况下的梯度
                 auto c_shape = grad_c.shape();
-                TensorType grad_input1 = Tensor(0, shape1);
-                TensorType grad_input2 = Tensor(0, shape2);
+                TensorType grad_input1 = Tensor(Scalar(0), shape1);
+                TensorType grad_input2 = Tensor(Scalar(0), shape2);
                 size_t total_dim = c_shape.size();
                 std::vector<size_t> idx(total_dim, 0);
 
@@ -298,8 +351,8 @@ namespace tiny_dl
                     }
                     size_t idx1 = this->map_index(idx, shape1, c_shape);
                     size_t idx2 = this->map_index(idx, shape2, c_shape);
-                    grad_input1.data()[idx1] += grad_c.data()[i];
-                    grad_input2.data()[idx2] += grad_c.data()[i];
+                    grad_input1.data(token)[idx1] = grad_input1.data()[idx1] + grad_c.data()[i];
+                    grad_input2.data(token)[idx2] = grad_input2.data()[idx2] + grad_c.data()[i];
                 }
                 return {grad_input1, grad_input2};
             }
@@ -308,6 +361,7 @@ namespace tiny_dl
         bool is_differentiable() const override { return true; }
     };
 
+    template <typename Scalar, typename Device>
     class MulFunction : public Function<Scalar, Device>
     {
     public:
@@ -316,7 +370,7 @@ namespace tiny_dl
         {
             if (inputs.size() != 2)
             {
-                throw std::runtime_error("AddFunction requires exactly 2 inputs");
+                throw std::runtime_error("MulFunction requires exactly 2 inputs");
             }
 
             ImplAccessToken token = this->get_token();
@@ -325,26 +379,27 @@ namespace tiny_dl
             this->save_inputs(token, {input1, input2}); // 保存输入
             auto input_shape1 = input1.shape();
             auto input_shape2 = input2.shape();
-            auto output_shape = broadcast_shape(input_shape1, input_shape2);
+            auto output_shape = this->broadcast_shape(input_shape1, input_shape2);
             TensorType output(output_shape); // 创建输出Tensor
+            size_t total_size = std::accumulate(output_shape.begin(), output_shape.end(), 1, std::multiplies<size_t>());
 
             if (input_shape1 == input_shape2)
             {
-                for (size_t i = 0; i < input_shape1; ++i)
+                for (size_t i = 0; i < total_size; ++i)
                 {
                     output.impl(token)->data()[i] = input1.data()[i] * input2.data()[i];
                 }
             }
             else if (input_shape1.size() == 1)
             {
-                for (size_t i = 0; i < input_shape2.size(); ++i)
+                for (size_t i = 0; i < total_size; ++i)
                 {
                     output.impl(token)->data()[i] = input1.data()[0] * input2.data()[i];
                 }
             }
             else if (input_shape2.size() == 1)
             {
-                for (size_t i = 0; i < input_shape1.size(); ++i)
+                for (size_t i = 0; i < total_size; ++i)
                 {
                     output.impl(token)->data()[i] = input1.data()[i] * input2.data()[0];
                 }
@@ -353,7 +408,6 @@ namespace tiny_dl
             {
                 // 获取广播后形状
                 auto total_dim = output_shape.size();
-                auto total_size = std::accumulate(output_shape.begin(), output_shape.end(), 1, std::multiplies<size_t>());
 
                 std::vector<size_t> idx(total_dim, 0); // 初始化索引为0
                 // 遍历每一个元素，将一维索引映射为多维索引
@@ -366,8 +420,8 @@ namespace tiny_dl
                         temp /= output_shape[j];
                     }
                     // 计算当前索引对应的元素在源张量中索引
-                    size_t idx1 = map_index(idx, input_shape1, output_shape);
-                    size_t idx2 = map_index(idx, input_shape2, output_shape);
+                    size_t idx1 = this->map_index(idx, input_shape1, output_shape);
+                    size_t idx2 = this->map_index(idx, input_shape2, output_shape);
 
                     output.impl(token)->data()[i] = input1.data()[idx1] * input2.data()[idx2];
                 }
@@ -382,7 +436,7 @@ namespace tiny_dl
             return {output};
         }
 
-        std::vector<TensorType> backward(const std::vector<TensorType> &grad_outputs) override
+        std::vector<TensorType> backward(std::vector<TensorType> grad_outputs) override
         {
             if (grad_outputs.size() != 1)
             {
@@ -390,7 +444,7 @@ namespace tiny_dl
             }
             ImplAccessToken token = this->get_token();
             auto grad_output = grad_outputs[0];
-            auto inputs = this->load_inputs(token);
+            auto inputs = this->get_saved_inputs(token);
             auto input1 = inputs[0];
             auto input2 = inputs[1];
             auto shape1 = input1.shape();
@@ -404,8 +458,8 @@ namespace tiny_dl
             else
             {
                 auto c_shape = grad_output.shape();
-                TensorType grad_input1 = Tensor(0, shape1);
-                TensorType grad_input2 = Tensor(0, shape2);
+                TensorType grad_input1 = Tensor(Scalar(0), shape1);
+                TensorType grad_input2 = Tensor(Scalar(0), shape2);
                 size_t total_dim = c_shape.size();
                 std::vector<size_t> idx(total_dim, 0);
 
@@ -419,8 +473,8 @@ namespace tiny_dl
                     }
                     size_t idx1 = this->map_index(idx, shape1, c_shape);
                     size_t idx2 = this->map_index(idx, shape2, c_shape);
-                    grad_input1.data()[idx1] += grad_output.data()[i] * input2.data()[idx2];
-                    grad_input2.data()[idx2] += grad_output.data()[i] * input1.data()[idx1];
+                    grad_input1.data(token)[idx1] += grad_output.data()[i] * input2.data()[idx2];
+                    grad_input2.data(token)[idx2] += grad_output.data()[i] * input1.data()[idx1];
                 }
                 return {grad_input1, grad_input2};
             }
