@@ -238,7 +238,7 @@ namespace tiny_dl
     public:
         std::vector<TensorType> forward(std::vector<TensorType> inputs) override
         {
-            printf("AddFunction::forward\n");
+            // printf("AddFunction::forward\n");
             if (inputs.size() != 2)
             {
                 throw std::runtime_error("AddFunction requires exactly 2 inputs");
@@ -257,6 +257,14 @@ namespace tiny_dl
             {
                 for (size_t i = 0; i < input_shape1.size(); ++i)
                 {
+                    if (!input1.data()[i])
+                    {
+                        throw std::runtime_error(" Addforward input1 data is null");
+                    }
+                    if (!input2.data()[i])
+                    {
+                        throw std::runtime_error(" Addforward input2 data is null");
+                    }
                     output.impl(token)->data()[i] = input1.data()[i] + input2.data()[i];
                 }
             }
@@ -325,6 +333,11 @@ namespace tiny_dl
             TensorType input2 = inputs[1];
             auto shape1 = input1.shape();
             auto shape2 = input2.shape();
+            // 检查输入shape是否有效
+            if (shape1.empty() || shape1[0] == 0 || shape2.empty() || shape2[0] == 0)
+            {
+                throw std::runtime_error("Invalid input shape in AddFunction backward");
+            }
             if (shape1 == shape2)
             {
                 TensorType grad_input1 = grad_c.clone();
@@ -449,6 +462,11 @@ namespace tiny_dl
             auto input2 = inputs[1];
             auto shape1 = input1.shape();
             auto shape2 = input2.shape();
+            // 检查输入shape是否有效
+            if (shape1.empty() || shape1[0] == 0 || shape2.empty() || shape2[0] == 0)
+            {
+                throw std::runtime_error("Invalid input shape in AddFunction backward");
+            }
             if (shape1 == shape2)
             {
                 TensorType grad_input1 = grad_output * input2;
