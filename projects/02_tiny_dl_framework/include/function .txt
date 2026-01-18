@@ -250,15 +250,12 @@ namespace tiny_dl
             this->save_inputs(token, {input1, input2}); // 保存输入
             auto input_shape1 = input1.shape();
             auto input_shape2 = input2.shape();
-            auto output_shape = this->broadcast_shape(input_shape1, input_shape2);
-            TensorType output(output_shape); // 创建输出Tensor
-            size_t total_size = std::accumulate(output_shape.begin(), output_shape.end(), 1, std::multiplies<size_t>());
-            // 创建输出Tensor
+            auto output_shape = this->broadcast_shape(input_shape1, input_shape2); // 广播形状
+            TensorType output(output_shape);                                       // 创建输出Tensor
 
             if (input_shape1 == input_shape2)
             {
-                // printf("Add input_shape1 == input_shape2\n");
-                for (size_t i = 0; i < total_size; ++i)
+                for (size_t i = 0; i < input_shape1.size(); ++i)
                 {
                     if (!input1.data()[i])
                     {
@@ -268,13 +265,11 @@ namespace tiny_dl
                     {
                         throw std::runtime_error(" Addforward input2 data is null");
                     }
-                    // printf("Add input1.data()[i] = %f, input2.data()[i] = %f\n", input1.data()[i], input2.data()[i]);
-                    output.data(token)[i] = input1.data()[i] + input2.data()[i];
+                    output.impl(token)->data()[i] = input1.data()[i] + input2.data()[i];
                 }
             }
             else if (input_shape1.size() == 1)
             {
-                printf("Add input_shape1.size() == 1\n");
                 for (size_t i = 0; i < input_shape2.size(); ++i)
                 {
                     output.impl(token)->data()[i] = input1.data()[0] + input2.data()[i];
@@ -282,7 +277,6 @@ namespace tiny_dl
             }
             else if (input_shape2.size() == 1)
             {
-                printf("Add input_shape2.size() == 1\n");
                 for (size_t i = 0; i < input_shape1.size(); ++i)
                 {
                     output.impl(token)->data()[i] = input1.data()[i] + input2.data()[0];
@@ -290,7 +284,6 @@ namespace tiny_dl
             }
             else
             {
-                printf("Add input_shape1.size() != 1 && input_shape2.size() != 1\n");
                 // 获取广播后形状
                 auto total_dim = output_shape.size();
                 auto total_size = std::accumulate(output_shape.begin(), output_shape.end(), 1, std::multiplies<size_t>());

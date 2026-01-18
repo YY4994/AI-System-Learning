@@ -169,7 +169,7 @@ namespace tiny_dl
         TensorImpl(const std::vector<size_t> &shape, bool requires_grad = false)
         {
             size_t total_size = std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<size_t>());
-            // printf("create TensorImpl with shape size %d", total_size);
+            printf("create TensorImpl with shape size %d", total_size);
             storage_ = std::make_shared<Storage<Scalar, AllocatorType>>(total_size);
             shape_ = shape;
             strides_ = compute_strides(shape);
@@ -433,14 +433,14 @@ namespace tiny_dl
         {
             if (shape1.size() != shape2.size())
             {
-                // printf("shape1.size() = %zu, shape2.size() = %zu\n", shape1.size(), shape2.size());
+                printf("shape1.size() = %zu, shape2.size() = %zu\n", shape1.size(), shape2.size());
                 return false;
             }
             for (size_t i = 0; i < shape1.size(); ++i)
             {
                 if (shape1[i] != shape2[i])
-                    // printf("shape1[%zu] = %zu, shape2[%zu] = %zu\n", i, shape1[i], i, shape2[i]);
-                    return false;
+                    printf("shape1[%zu] = %zu, shape2[%zu] = %zu\n", i, shape1[i], i, shape2[i]);
+                return false;
             }
             return true;
         }
@@ -458,13 +458,13 @@ namespace tiny_dl
         }
         explicit Tensor(const std::vector<size_t> &shape, bool requires_grad = false)
         {
-            // printf("Tensor(const std::vector<size_t> &shape, bool requires_grad = false)\n");
+            printf("Tensor(const std::vector<size_t> &shape, bool requires_grad = false)\n");
             impl_ = std::make_shared<ImplType>(shape, requires_grad);
         }
         // 从标量构造（广播）
         Tensor(Scalar value, bool requires_grad = false) noexcept
         {
-            // printf("Tensor(Scalar value, bool requires_grad = false)\n");
+            printf("Tensor(Scalar value, bool requires_grad = false)\n");
             impl_ = std::make_shared<ImplType>(shape, requires_grad);
         }
         // 从标量构造（广播）
@@ -622,7 +622,7 @@ namespace tiny_dl
         // 反向传播
         void backward()
         {
-            // printf("backward\n");
+            printf("backward\n");
             // 检查是否需要梯度计算
             if (!requires_grad())
             {
@@ -660,17 +660,17 @@ namespace tiny_dl
                 }
                 // 2. 执行反向传播
                 auto grad_inputs = func->backward(grad_outputs);
-                // printf("grad_inputs size: %d\n", grad_inputs.size());
+                printf("grad_inputs size: %d\n", grad_inputs.size());
                 // 3. 将梯度累加到输入Tensor
                 auto saved_inputs = func->get_saved_inputs(token);
-                // printf("start set grad for inputs %d\n", saved_inputs.size());
+                printf("start set grad for inputs %d\n", saved_inputs.size());
                 for (size_t i = 0; i < saved_inputs.size(); ++i)
                 {
                     if (saved_inputs[i].requires_grad())
                     {
                         // 获取当前输入的梯度
                         auto current_grad = saved_inputs[i].grad();
-                        // printf("set grad for inputs%d\n", i);
+                        printf("set grad for inputs%d\n", i);
                         auto grad_input_impl = grad_inputs[i].impl(token);
                         if (!grad_input_impl)
                         {
@@ -681,19 +681,23 @@ namespace tiny_dl
                         // 如果还没有梯度，直接设置,成功！
                         if (current_grad.impl(token) == nullptr || current_grad.impl(token)->shape()[0] == 0)
                         {
-                            // std::cout << "current grad is null" << grad_inputs[i].impl(token)->data() << std::endl;
+                            std::cout << "current grad is null" << grad_inputs[i].impl(token)->data() << std::endl;
                             saved_inputs[i].impl(token)->set_grad(grad_inputs[i].impl(token));
                         }
                         else
                         {
                             // 累加梯度
-                            // std::cout << "current grad is not null" << std::endl;
-                            if (grad_inputs[i].impl(token) == nullptr)
+                            std::cout << "current grad is not null" << std::endl;
+                            if (grad_inputs[i].impl(token) != nullptr)
+                            {
+                                std::cout << "grad_inputs is not null" << std::endl;
+                            }
+                            else
                             {
                                 std::runtime_error("grad_inputs is null");
                             }
                             auto sum_grad = current_grad + grad_inputs[i];
-                            // std::cout << "current grad is not null" << sum_grad.impl(token)->data() << std::endl;
+                            std::cout << "current grad is not null" << sum_grad.impl(token)->data() << std::endl;
                             saved_inputs[i].impl(token)->set_grad(sum_grad.impl(token));
                         }
                     }
@@ -718,14 +722,14 @@ namespace tiny_dl
             static_assert(std::is_same_v<Device, otherDevice>, "Tensor operations add require same device type");
             if (this->requires_grad() || other.requires_grad())
             {
-                // printf("requires_grad chose AddFunction\n");
+                printf("requires_grad chose AddFunction\n");
                 auto func = std::make_shared<tiny_dl::AddFunction<Scalar, Device>>();
                 auto result = func->forward({*this, other});
                 return result[0]; // 返回第一个元素
             }
             else
             {
-                // printf("requires_grad chose Add\n");
+                printf("requires_grad chose Add\n");
                 static const std::vector<size_t> empty_shape; // 空向量
                 if (this->impl_->shape() == empty_shape || this->impl_->shape()[0] == 0)
                 {
@@ -738,7 +742,7 @@ namespace tiny_dl
                 // 问题代码
                 if (shapes_equal(this->impl_->shape(), other.impl_->shape()))
                 {
-                    // printf("Add: same shape\n");
+                    printf("Add: same shape\n");
                     Tensor<Scalar, Device> result(this->impl_->shape());
                     for (size_t i = 0; i < this->impl_->size(); ++i)
                     {
@@ -748,7 +752,7 @@ namespace tiny_dl
                 }
                 else if (this->impl_->shape().size() == 1)
                 {
-                    // printf("Add: this shape is 1\n");
+                    printf("Add: this shape is 1\n");
                     Tensor<Scalar, Device> result(other.impl_->shape());
                     for (size_t i = 0; i < other.impl_->size(); ++i)
                     {
@@ -758,7 +762,7 @@ namespace tiny_dl
                 }
                 else if (other.impl_->shape().size() == 1)
                 {
-                    // printf("Add: other shape is 1\n");
+                    printf("Add: other shape is 1\n");
                     Tensor<Scalar, Device> result(this->impl_->shape());
                     for (size_t i = 0; i < this->impl_->size(); ++i)
                     {
@@ -768,7 +772,7 @@ namespace tiny_dl
                 }
                 else
                 {
-                    // printf("Add: both shape are more than 1\n");
+                    printf("Add: both shape are more than 1\n");
                     // 获取广播后形状
                     auto result_shape = broadcast_shape(this->impl_->shape(), other.impl_->shape());
                     Tensor<Scalar, Device> result(result_shape);
