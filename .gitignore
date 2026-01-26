@@ -37,7 +37,40 @@
 *.out
 *.app
 
-# debug information files
+# Debug information files
 *.dwo
 
-*.vscode/*
+# IDE directories
+.vscode/
+.build/
+.idea/
+
+# Build directories
+build/
+cmake-build-*/
+out/
+bin/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Project specific patterns
+projects/03_Mini-LibTorch_Inference/CMakeFiles/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*~
+*.swp
+*.bak
